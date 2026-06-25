@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Mock data (ảnh lớn, không cần push)
+mock-data/
+
+# MLflow local
+mlruns/
+mlflow.db
+
+# Temp files
+/tmp/
+*.log
+*.pt.tmp
+
+# K8s generated jobs
+k8s_jobs/
+
+# OS
+.DS_Store
+Thumbs.db

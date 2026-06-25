@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: uav-train-JOB_ID
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: uav-trainer:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TRAINING_LEVEL
+              value: "TRAINING_LEVEL_PLACEHOLDER"
+            - name: CHECKPOINT_KEY
+              value: "CHECKPOINT_KEY_PLACEHOLDER"
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                secretKeyRef:
+                  name: ceph-s3-secret
+                  key: MLFLOW_TRACKING_URI
+            - name: MLFLOW_S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ceph-s3-secret
+                  key: MLFLOW_S3_ENDPOINT_URL
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ceph-s3-secret
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ceph-s3-secret
+                  key: AWS_SECRET_ACCESS_KEY
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
