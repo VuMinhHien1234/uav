@@ -3,14 +3,14 @@
 ## Tổng quan
 
 ```
-Bước 1   Tạo GCP VM
+Bước 1   Tạo GCP VM (boot 100GB + 3 disk Ceph OSD)
 Bước 2   Cài dependencies (Docker, Python, AWS CLI)
-Bước 3   Cài Ceph (cephadm) + RadosGW
+Bước 3   Cài Ceph (cephadm) + 3 OSD + RadosGW
 Bước 4   Clone repo + pip install
 Bước 5   Khởi động Kafka + MLflow (Docker Compose)
-Bước 6   Tạo Ceph buckets
-Bước 7   Cấu hình Bucket Notification → Kafka
-Bước 8   Setup k3s + KServe + K8s secrets
+Bước 6   Tạo Ceph user + buckets
+Bước 7   (Bỏ qua) Bucket Notification — dùng Kafka direct thay thế
+Bước 8   Setup k3s + K8s secrets
 Bước 9   Build Docker image cho K8s training job
 Bước 10  Chạy demo
 ```
@@ -26,15 +26,17 @@ Bước 10  Chạy demo
 gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
 
-# Tạo VM (e2-standard-4: 4 vCPU, 16GB RAM)
+# Tạo VM (e2-standard-4: 4 vCPU, 16GB RAM, boot 100GB + 3 OSD disks)
 gcloud compute instances create uav-pipeline-vm \
   --zone=asia-southeast1-b \
   --machine-type=e2-standard-4 \
   --image-family=ubuntu-2204-lts \
   --image-project=ubuntu-os-cloud \
-  --boot-disk-size=50GB \
+  --boot-disk-size=100GB \
   --boot-disk-type=pd-balanced \
-  --create-disk=name=ceph-osd,size=20GB,type=pd-balanced \
+  --create-disk=name=ceph-osd-1,size=20GB,type=pd-balanced \
+  --create-disk=name=ceph-osd-2,size=20GB,type=pd-balanced \
+  --create-disk=name=ceph-osd-3,size=20GB,type=pd-balanced \
   --tags=http-server,https-server
 
 # Mở firewall cho các port cần thiết
@@ -47,6 +49,12 @@ gcloud compute firewall-rules create uav-pipeline-ports \
 gcloud compute ssh uav-pipeline-vm --zone=asia-southeast1-b
 ```
 
+> **SSH thủ công (không có gcloud):** Tạo SSH key trên Mac rồi thêm vào VM qua GCP Console → Metadata → SSH Keys.
+> ```bash
+> ssh-keygen -t ed25519 -f ~/.ssh/gcp_uav -C "YOUR_VM_USERNAME"
+> ssh -i ~/.ssh/gcp_uav YOUR_VM_USERNAME@VM_EXTERNAL_IP
+> ```
+
 ---
 
 ## Bước 2 — Cài dependencies
@@ -58,7 +66,7 @@ gcloud compute ssh uav-pipeline-vm --zone=asia-southeast1-b
 sudo apt-get update && sudo apt-get upgrade -y
 
 # Cài Python 3.11, pip, venv
-sudo apt-get install -y python3.11 python3.11-venv python3-pip git curl wget
+sudo apt-get install -y python3.11 python3.11-venv python3-pip git curl wget unzip
 
 # Cài Docker
 curl -fsSL https://get.docker.com | sudo sh
@@ -98,54 +106,35 @@ sudo cephadm bootstrap \
   --initial-dashboard-password adminpassword \
   --skip-monitoring-stack
 
-# Thêm shell alias
-sudo cephadm shell -- ceph -s   # kiểm tra cluster health
-# Hoặc dùng trực tiếp:
-alias ceph='sudo cephadm shell -- ceph'
+# Kiểm tra cluster
+sudo cephadm shell -- ceph -s
 ```
 
-### 3.2 Thêm OSD (disk /dev/sdb — disk 20GB vừa tạo)
+### 3.2 Thêm 3 OSD (3 disk 20GB vừa tạo)
 
 ```bash
-# Kiểm tra disk
+# Kiểm tra disk — phải thấy /dev/sdb, /dev/sdc, /dev/sdd
 lsblk
 
-# Thêm OSD
+# Thêm 3 OSD
 sudo cephadm shell -- ceph orch daemon add osd $(hostname):/dev/sdb
+sudo cephadm shell -- ceph orch daemon add osd $(hostname):/dev/sdc
+sudo cephadm shell -- ceph orch daemon add osd $(hostname):/dev/sdd
 
-# Kiểm tra OSD up
+# Đợi OSD up
 sudo cephadm shell -- ceph osd tree
+# Phải thấy 3 OSD đều up
+
+# Kiểm tra cluster healthy
+sudo cephadm shell -- ceph -s
+# Mong đợi: HEALTH_OK, osd: 3 osds: 3 up
 ```
 
-### 3.3 Fix replication size cho single-node
-
-> Single VM chỉ có 1 OSD. Mặc định Ceph yêu cầu 3 bản sao (size=3) → PGs không active → RGW bị treo.
-> Fix: giảm xuống size=1 (không replication, phù hợp cho dev/test).
+### 3.3 Bật RadosGW (S3 endpoint port 7480)
 
 ```bash
-# Giảm replication size
-sudo cephadm shell -- ceph config set global osd_pool_default_size 1
-sudo cephadm shell -- ceph config set global osd_pool_default_min_size 1
-
-# Fix tất cả pools hiện tại (bao gồm .mgr và các pool RGW tạo ra)
-sudo cephadm shell -- bash -c "
-  for pool in \$(ceph osd pool ls); do
-    ceph osd pool set \$pool size 1 --yes-i-really-mean-it 2>/dev/null
-    ceph osd pool set \$pool min_size 1 2>/dev/null
-  done
-  ceph -s
-"
-
-# Đợi cluster healthy
-watch sudo cephadm shell -- ceph -s
-# Ctrl+C khi thấy pgs: active+clean
-```
-
-### 3.4 Bật RadosGW (S3 endpoint port 7480)
-
-```bash
-# Bật RGW
-sudo cephadm shell -- ceph orch apply rgw default
+# Bật RGW trên port 7480
+sudo cephadm shell -- ceph orch apply rgw default --port 7480
 
 # Đợi 30s rồi kiểm tra
 sleep 30
@@ -200,7 +189,7 @@ docker-compose ps
 # Cả 3 services (zookeeper, kafka, mlflow) phải ở trạng thái Up
 
 # Test Kafka
-docker exec kafka kafka-topics.sh --list --bootstrap-server localhost:9092
+docker exec kafka kafka-topics --list --bootstrap-server localhost:9092
 
 # Test MLflow
 curl http://localhost:5000/health
@@ -208,7 +197,7 @@ curl http://localhost:5000/health
 
 ---
 
-## Bước 6 — Tạo Ceph user + 5 buckets
+## Bước 6 — Tạo Ceph user + 4 buckets
 
 ```bash
 cd ~/uav-pipeline
@@ -222,13 +211,14 @@ Output mong đợi:
 [Setup] Creating Ceph S3 user...
 [Setup] Configuring AWS CLI...
 [Setup] Creating buckets...
-  ✓ s3://raw-frames
-  ✓ s3://embeddings
   ✓ s3://checkpoints
   ✓ s3://training-data
   ✓ s3://mlflow-artifacts
+  ✓ s3://fast-weight-state
 [Setup] Done!
 ```
+
+> **Lưu ý:** Không còn bucket `raw-frames` — UAV upload frame thẳng vào `training-data`.
 
 Verify:
 ```bash
@@ -237,48 +227,39 @@ aws --endpoint-url http://localhost:7480 s3 ls
 
 ---
 
-## Bước 7 — Cấu hình Bucket Notification → Kafka
+## Bước 7 — (Đã bỏ) Bucket Notification
 
-```bash
-cd ~/uav-pipeline
-source venv/bin/activate
-
-bash scripts/setup_bucket_notification.sh
-```
-
-Output mong đợi:
-```
-[Notification] Enabling pubsub module...
-[Notification] Creating SNS topic → Kafka...
-  raw-frames topic: arn:aws:sns:us-east-1:000000000000:uav-frames
-  checkpoints topic: arn:aws:sns:us-east-1:000000000000:uav-checkpoints
-[Notification] Setting bucket notifications...
-  ✓ raw-frames notification set
-  ✓ checkpoints notification set
-```
-
-Verify:
-```bash
-aws --endpoint-url http://localhost:7480 s3api \
-  get-bucket-notification-configuration --bucket raw-frames
-```
+> **Không cần chạy bước này.** Pipeline dùng Kafka direct publish — `flight_agent` tự publish event lên Kafka sau mỗi frame upload. Không phụ thuộc vào Ceph bucket notification.
 
 ---
 
-## Bước 8 — Setup k3s + KServe + K8s secrets
+## Bước 8 — Setup k3s + K8s secrets
+
+> **Không cần KServe.** Inference chạy trên UAV edge (Jetson Nano). K8s chỉ dùng để spawn training jobs.
 
 ### 8.1 Cài k3s (self-managed Kubernetes)
 
-k3s là Kubernetes nhẹ, cài 1 lệnh, chạy thẳng trên VM — không cần Docker bên trong như minikube.
-
 ```bash
+# Cấu hình local registry trước khi cài k3s
+sudo mkdir -p /etc/rancher/k3s
+cat << 'EOF' | sudo tee /etc/rancher/k3s/registries.yaml
+mirrors:
+  "localhost:5001":
+    endpoint:
+      - "http://localhost:5001"
+EOF
+
 # Cài k3s
 curl -sfL https://get.k3s.io | sh -
+
+# Nếu thấy "No change detected so skipping service start" → start thủ công
+sudo systemctl start k3s
 
 # Cấu hình kubectl không cần sudo
 mkdir -p ~/.kube
 sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
 sudo chown $USER ~/.kube/config
+sudo chmod 644 /etc/rancher/k3s/k3s.yaml
 
 # Verify
 kubectl get nodes
@@ -286,19 +267,7 @@ kubectl get nodes
 # uav-pipeline-vm   Ready    control-plane,master   1m
 ```
 
-### 8.2 Cài KServe
-
-```bash
-# Cài cert-manager (KServe cần)
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-kubectl wait --for=condition=Ready pod -l app=cert-manager -n cert-manager --timeout=120s
-
-# Cài KServe
-kubectl apply -f https://github.com/kserve/kserve/releases/latest/download/kserve.yaml
-kubectl wait --for=condition=Ready pod -l control-plane=kserve-controller-manager -n kserve --timeout=120s
-```
-
-### 8.3 Tạo K8s secret với VM IP thật
+### 8.2 Tạo K8s secret với VM IP thật
 
 ```bash
 VM_IP=$(hostname -I | awk '{print $1}')
@@ -318,44 +287,30 @@ kubectl get secret ceph-s3-secret -o jsonpath='{.data.MLFLOW_TRACKING_URI}' | ba
 # Phải ra: http://<VM_IP>:5000 (không phải localhost)
 ```
 
-### 8.4 Tạo KServe InferenceService placeholder
-
-```bash
-cat <<EOF | kubectl apply -f -
-apiVersion: serving.kserve.io/v1beta1
-kind: InferenceService
-metadata:
-  name: uav-navigator
-  namespace: default
-spec:
-  predictor:
-    model:
-      modelFormat:
-        name: pytorch
-      storageUri: s3://mlflow-artifacts/placeholder
-EOF
-
-kubectl get inferenceservice uav-navigator
-```
-
 ---
 
 ## Bước 9 — Build Docker image cho K8s training job
 
-k3s dùng **containerd** thay vì Docker — cần import image vào containerd.
+k3s dùng **containerd** riêng — dùng local registry để bridge với Docker.
 
 ```bash
 cd ~/uav-pipeline
 
-# Build image bằng Docker
+# Chạy local registry (port 5001, tránh conflict với MLflow 5000)
+docker run -d -p 5001:5000 --name local-registry registry:2
+
+# Build image
 docker build -t uav-trainer:latest .
 
-# Export từ Docker rồi import vào containerd của k3s
-docker save uav-trainer:latest | sudo k3s ctr images import -
+# Push vào local registry
+docker tag uav-trainer:latest localhost:5001/uav-trainer:latest
+docker push localhost:5001/uav-trainer:latest
 
-# Verify image có trong containerd
+# k3s pull image từ local registry
+sudo k3s ctr images pull --plain-http localhost:5001/uav-trainer:latest
+
+# Verify
 sudo k3s ctr images ls | grep uav-trainer
-# Phải thấy: docker.io/library/uav-trainer:latest
 ```
 
 ---
@@ -365,80 +320,148 @@ sudo k3s ctr images ls | grep uav-trainer
 ```bash
 cd ~/uav-pipeline
 source venv/bin/activate
-
-# Set PYTHONPATH để Python tìm được các modules
 export PYTHONPATH=$PWD
 
-# Tạo mock data (90 ảnh, 3 môi trường)
+# Tạo mock data: 5 terrain × 50 frames = 250 frames
 python3 scripts/download_mock_data.py
-
-# Chạy demo đầy đủ
-bash scripts/demo.sh
 ```
 
-Output mong đợi:
+Output:
 ```
-============================================================
- UAV Nested Learning Demo
-============================================================
+Generating mock UAV frames → mock-data/
+  5 terrains × 50 frames = 250 total
 
-[0] Checking services...
-  ✓ Ceph RadosGW OK
-  ✓ MLflow OK
-  ✓ Kafka OK
-  ✓ K8s (k3s) OK
-  ✓ uav-trainer image OK
-
-[1] Generating mock frames...
-  ✓ env1 (Urban):  30 frames
-  ✓ env2 (Forest): 30 frames
-  ✓ env3 (Desert): 30 frames
-
-[2] Starting consumers (background)...
-  UC1 PID: 12345  (tail /tmp/uc1.log)
-  UC2 PID: 12346  (tail /tmp/uc2.log)
-
-[3] Starting UC3 Simulator...
-Frame 0000 | env1 | 🟢 FAST         | delta=0.000  drift=0.0
-Frame 0001 | env1 | ⚫ SKIP         | delta=0.023  drift=0.0
-Frame 0002 | env1 | 🟢 FAST         | delta=0.187  drift=0.2
-...
-Frame 0030 | env2 | 🟡 MEDIUM       | delta=0.521  drift=4.3
-...
-Frame 0060 | env3 | 🔴 SLOW         | delta=0.489  drift=50.1
-
-[4] Results...
-  --- Ceph Buckets ---
-  raw-frames:        45 objects
-  embeddings:        45 objects
-  checkpoints:        2 objects
-  mlflow-artifacts:  12 objects
-
-  --- MLflow ---
-  Run: a1b2c3d4...  acc=0.8412  lat=142.3ms
-  Run: e5f6g7h8...  acc=0.7891  lat=167.1ms
-
-============================================================
- Demo complete!
- MLflow UI:        http://localhost:5000
- Ceph dashboard:   https://localhost:8443  (admin/adminpassword)
-============================================================
+  ✓ urban      (Urban   )  skip=10  fast=32  medium= 6  slow= 2
+  ✓ forest     (Forest  )  skip=20  fast=20  medium= 6  slow= 4
+  ✓ desert     (Desert  )  skip=25  fast=15  medium= 8  slow= 2
+  ✓ coastal    (Coastal )  skip=20  fast=20  medium= 7  slow= 3
+  ✓ mountain   (Mountain)  skip= 0  fast=29  medium=14  slow= 7
 ```
 
 ---
 
-## Xem logs từng consumer
+### Demo A — Chạy tự động (toàn bộ pipeline)
+
+Chạy 1 lệnh, demo mặc định terrain `mountain`:
 
 ```bash
-# UC1 — frame processor
-tail -f /tmp/uc1.log
+bash scripts/demo.sh
+```
 
-# UC2 — checkpoint validator
-tail -f /tmp/uc2.log
+Muốn đổi terrain:
+```bash
+FLIGHT_TERRAIN=forest bash scripts/demo.sh
+```
 
-# K8s jobs
+---
+
+### Demo B — Chạy thủ công từng bước (khuyến nghị khi thuyết trình)
+
+**Terminal 1** — Khởi động consumer (giữ mở suốt):
+```bash
+cd ~/uav-pipeline
+source venv/bin/activate
+export PYTHONPATH=$PWD
+python3 -m consumers.model_trainer
+```
+
+**Terminal 2** — Chạy từng terrain, quan sát kết quả:
+
+```bash
+cd ~/uav-pipeline
+source venv/bin/activate
+export PYTHONPATH=$PWD
+
+# --- Lần 1: Địa hình núi ---
+# UAV bay, upload frames, trigger retrain
+# → Tạo model: uav-navigator-mountain v1 (bắt đầu từ ImageNet)
+FLIGHT_TERRAIN=mountain python3 -m simulator.flight_agent
+
+# --- Lần 2: Địa hình rừng ---
+# Terrain khác → model khác hoàn toàn
+# → Tạo model: uav-navigator-forest v1
+FLIGHT_TERRAIN=forest python3 -m simulator.flight_agent
+
+# --- Lần 3: Bay lại núi ---
+# Cùng terrain → fine-tune trên model đã có
+# → Tạo model: uav-navigator-mountain v2
+#   accuracy cao hơn v1, loss thấp hơn, prev_version=1
+FLIGHT_TERRAIN=mountain python3 -m simulator.flight_agent
+```
+
+---
+
+### Những gì quan sát được trong demo
+
+**Logs Terminal 2** (flight_agent) — frame-by-frame:
+```
+Frame 0000 | mountain | 🟢 FAST     | surprise=0.0021  drift=0.002  Wf=0.0012  Wm=0.0004  Ws=0.0001
+Frame 0001 | mountain | 🟢 FAST     | surprise=0.0018  drift=0.004  Wf=0.0023  Wm=0.0008  Ws=0.0002
+Frame 0005 | mountain | 🟡 MEDIUM   | surprise=0.0042  drift=0.018  Wf=0.0089  Wm=0.0034  Ws=0.0009
+Frame 0036 | mountain | 🔴 SLOW     | surprise=0.0058  drift=0.103  Wf=0.1240  Wm=0.0478  Ws=0.0121
+```
+
+**Logs Terminal 1** (model_trainer) — training events:
+```
+Retrain event received: level=slow  key=slow/terrain_mountain/flight_1234_5678.json
+Terrain: mountain
+K8s Job uav-train-1234 created
+K8s Job uav-train-1234 completed
+Metrics → accuracy=0.8412  latency=142.3ms  loss=0.2841
+PASS — promoting uav-navigator-mountain to Staging
+```
+
+**MLflow UI** `http://localhost:5000` — sau khi chạy:
+
+| Run | Terrain | prev_version | accuracy | loss | W_fast_norm |
+|-----|---------|-------------|----------|------|-------------|
+| uav-retrain-slow-mountain-run1 | mountain | imagenet | ~0.84 | ~0.28 | thấp |
+| uav-retrain-slow-forest-run1   | forest   | imagenet | ~0.83 | ~0.30 | thấp |
+| uav-retrain-slow-mountain-run2 | mountain | 1        | ~0.89 | ~0.15 | cao hơn |
+
+> Lần 1 (run1): `prev_version=imagenet` → dùng mock metrics (FC chưa được train → pseudo-labels không tin cậy) → promote lên **Staging**.
+> Lần 3 (mountain run2): `prev_version=1` → dùng pseudo-labels thật từ flight lần 1 → accuracy/loss thật → nếu pass threshold thì promote lên **Production**.
+> `W_fast_norm` / `W_med_norm` / `W_slow_norm` tăng dần — Titans memory tích lũy qua các chuyến bay.
+
+---
+
+### Xem kết quả Ceph sau demo
+
+```bash
+# Frames đã upload (theo terrain + flight)
+aws --endpoint-url http://localhost:7480 s3 ls s3://training-data/ --recursive
+
+# Checkpoints đã tạo
+aws --endpoint-url http://localhost:7480 s3 ls s3://checkpoints/ --recursive
+
+# W matrices (Titans memory state)
+aws --endpoint-url http://localhost:7480 s3 ls s3://fast-weight-state/ --recursive
+```
+
+### Xem MLflow từ Mac (SSH tunnel)
+
+```bash
+# Chạy trên Mac
+ssh -i ~/.ssh/gcp_uav -L 5000:localhost:5000 -L 8443:localhost:8443 \
+  YOUR_VM_USERNAME@VM_EXTERNAL_IP -N
+```
+
+Sau đó mở `http://localhost:5000` trên Mac.
+
+---
+
+## Xem logs
+
+```bash
+# model_trainer — training orchestrator
+tail -f /tmp/model_trainer.log
+
+# K8s training jobs
 kubectl get jobs
 kubectl logs job/uav-train-<ID>
+
+# Tất cả K8s pods
+kubectl get pods
 ```
 
 ---
@@ -449,6 +472,19 @@ kubectl logs job/uav-train-<ID>
 ```bash
 sudo cephadm shell -- ceph -s
 sudo cephadm shell -- ceph health detail
+```
+
+**RGW không accessible sau khi start:**
+```bash
+# Kiểm tra port thật sự đang listen
+sudo ss -tlnp | grep 7480
+
+# Kiểm tra container RGW
+sudo docker ps | grep rgw
+sudo docker logs $(sudo docker ps --format "{{.Names}}" | grep rgw | head -1) 2>&1 | tail -20
+
+# Thử curl
+curl http://localhost:7480
 ```
 
 **MLflow không connect được Ceph (artifact upload fail):**
@@ -465,31 +501,34 @@ kubectl get secret ceph-s3-secret -o jsonpath='{.data.MLFLOW_TRACKING_URI}' | ba
 # Phải là http://<VM_IP>:5000, không phải localhost
 ```
 
+**`No frames for terrain='xyz'` khi chạy flight_agent:**
+```bash
+# Chạy lại generate mock data
+python3 scripts/download_mock_data.py
+
+# Kiểm tra terrain có trong mock-data/
+ls mock-data/
+# urban  forest  desert  coastal  mountain
+```
+
 **Import error khi chạy Python:**
 ```bash
 # Đảm bảo PYTHONPATH được set
 export PYTHONPATH=$PWD   # chạy từ ~/uav-pipeline
 ```
 
-**k3s không start được / kubectl lỗi:**
+**k3s không start được / kubectl lỗi permission:**
 ```bash
-# Kiểm tra k3s service
-sudo systemctl status k3s
-
-# Xem logs
-sudo journalctl -u k3s -n 50
-
-# Restart k3s
-sudo systemctl restart k3s
-
-# Kiểm tra kubeconfig đúng chưa
-kubectl config view
+sudo systemctl start k3s
+sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+kubectl get nodes
 ```
 
-**Image không tìm thấy trong k3s (ErrImageNeverPull):**
+**uav-trainer image không tìm thấy trong k3s:**
 ```bash
-# Import lại image vào containerd
-docker save uav-trainer:latest | sudo k3s ctr images import -
+# Push lại vào local registry
+docker push localhost:5001/uav-trainer:latest
+sudo k3s ctr images pull --plain-http localhost:5001/uav-trainer:latest
 sudo k3s ctr images ls | grep uav-trainer
 ```
 

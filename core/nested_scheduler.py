@@ -1,14 +1,17 @@
 """
-NestedLearningScheduler — per-frame decision: fast / medium / slow / memory_hit / skip.
+NestedLearningScheduler — Titans edition.
 
-Decision logic (NeurIPS 2025 Nested Learning pattern):
-  memory_hit — cosine_sim with stored frame > NL_MEMORY_THRESHOLD → recall action
-  slow       — accumulated drift >= NL_SLOW_ACCUMULATOR → full retrain
-  medium     — single-frame delta >= NL_MEDIUM_DELTA    → fine-tune
-  fast       — single-frame delta >= NL_FAST_DELTA      → local adapt + save memory
-  skip       — delta below all thresholds               → no action
+Replaces blind Hebbian memory update with gradient-based Titans memory.
+
+Key changes vs Hebbian edition:
+  - Memory update happens INSIDE recall_all() — no separate update_memory() call needed.
+  - delta is now Titans' surprise score (MSE reconstruction error) instead of cosine distance.
+  - update_memory() removed — flight_agent no longer needs action_emb for memory update.
+
+Surprise score semantics (same as old delta semantics):
+  low surprise  → terrain is familiar → SKIP / FAST
+  high surprise → terrain is new      → MEDIUM / SLOW → trigger Kafka retrain event
 """
-
 
 import logging
 
@@ -16,69 +19,56 @@ import torch
 import torch.nn.functional as F
 
 from config import settings
-from core.path_memory import VisualPathMemory
+from core.titans_memory import TitansMemory
 
 logger = logging.getLogger(__name__)
 
 
 class NestedLearningScheduler:
-    
-    def __init__(self):
-        self.memory            = VisualPathMemory()
+
+    def __init__(self, terrain: str = None):
+        self.memory            = TitansMemory(terrain=terrain)
         self.drift_accumulator = 0.0
-        self.prev_features: torch.Tensor | None = None
+        self.last_combined: torch.Tensor | None = None
 
     def decide(self, current_features: torch.Tensor, frame_id: str = None):
         """
-        Args:
-            current_features: tensor of shape (512,) or (1, 512)
-            frame_id:         optional identifier for logging
+        Xử lý một frame:
+          1. Truy hồi từ Titans memory + cập nhật gradient tại chỗ (inner loop).
+          2. Xây dựng vector tổng hợp: input + recall.
+          3. Phân loại mức độ theo surprise score (thay thế cosine delta).
+          4. Tích lũy drift để kích hoạt slow trigger.
 
-        Returns:
-            (level, recalled_action_or_None, debug_info)
+        Trả về (level, debug_dict) — API giữ nguyên so với phiên bản Hebbian.
         """
-        cur = current_features.float().squeeze()
+        x = current_features.float().squeeze()
 
-        # ── Step 0: check path memory ──────────────────────────────────────
-        recalled_action, confidence = self.memory.recall(cur.tolist())
-        if recalled_action is not None:
-            return "memory_hit", recalled_action, {
-                "level":      "memory_hit",
-                "confidence": round(confidence, 3),
-                "drift_acc":  round(self.drift_accumulator, 2),
-            }
+        # Inner loop: recall + gradient update, returns (combined_recall, surprise)
+        recall, surprise = self.memory.recall_all(x)
 
-        # ── Step 1: compute delta vs previous frame ────────────────────────
-        if self.prev_features is None:
-            self.prev_features = cur.detach()
-            return "fast", None, {"level": "fast", "delta": 0.0, "drift_acc": 0.0}
+        # Combined: input enriched by Titans memory
+        combined = F.normalize(x + recall, dim=0)
+        self.last_combined = combined.detach()
 
-        sim   = F.cosine_similarity(cur.unsqueeze(0), self.prev_features.unsqueeze(0)).item()
-        delta = 1.0 - sim
+        # Surprise replaces cosine delta — same threshold semantics
+        delta = surprise
         self.drift_accumulator += delta
-        self.prev_features = cur.detach()
 
         debug = {
-            "delta":    round(delta, 3),
-            "drift_acc": round(self.drift_accumulator, 2),
-            "sim":      round(sim, 3),
+            "level":     "?",
+            "delta":     round(delta,                    4),
+            "surprise":  round(surprise,                 4),
+            "drift_acc": round(self.drift_accumulator,   2),
+            "wf_norm":   round(self.memory.fast.norm,    4),
+            "wm_norm":   round(self.memory.med.norm,     4),
+            "ws_norm":   round(self.memory.slow.norm,    4),
         }
 
-        # ── Step 2: decide level ───────────────────────────────────────────
         if self.drift_accumulator >= settings.NL_SLOW_ACCUMULATOR:
             self.drift_accumulator = 0.0
-            return "slow", None, {**debug, "level": "slow"}
+            return "slow",   {**debug, "level": "slow"}
         if delta >= settings.NL_MEDIUM_DELTA:
-            return "medium", None, {**debug, "level": "medium"}
+            return "medium", {**debug, "level": "medium"}
         if delta >= settings.NL_FAST_DELTA:
-            return "fast", None, {**debug, "level": "fast"}
-        return "skip", None, {**debug, "level": "skip"}
-
-    def save_memory(
-        self,
-        frame_id: str,
-        features: torch.Tensor,
-        action: str = "straight",
-        reward: float = 0.5,
-    ):
-        self.memory.remember(frame_id, features.squeeze(), action, reward)
+            return "fast",   {**debug, "level": "fast"}
+        return "skip",   {**debug, "level": "skip"}

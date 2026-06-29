@@ -7,6 +7,7 @@
 set -e
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
+export PYTHONPATH="${PROJECT_ROOT}"
 
 echo "============================================================"
 echo " UAV Nested Learning Demo"
@@ -15,15 +16,15 @@ echo ""
 
 # ── Verify services ──────────────────────────────────────────────────────────
 echo "[0] Checking services..."
-radosgw-admin bucket list > /dev/null 2>&1 \
+aws --endpoint-url http://localhost:7480 s3 ls > /dev/null 2>&1 \
   && echo "  ✓ Ceph RadosGW OK" \
-  || { echo "  ✗ Ceph NOT running"; exit 1; }
+  || { echo "  ✗ Ceph NOT running. Check: curl http://localhost:7480"; exit 1; }
 
 curl -sf http://localhost:5000/health > /dev/null \
   && echo "  ✓ MLflow OK" \
   || { echo "  ✗ MLflow NOT running"; exit 1; }
 
-kafka-topics.sh --list --bootstrap-server localhost:9092 > /dev/null 2>&1 \
+docker exec kafka kafka-topics --list --bootstrap-server localhost:9092 > /dev/null 2>&1 \
   && echo "  ✓ Kafka OK" \
   || { echo "  ✗ Kafka NOT running"; exit 1; }
 
@@ -33,7 +34,12 @@ kubectl get nodes > /dev/null 2>&1 \
 
 sudo k3s ctr images ls 2>/dev/null | grep -q uav-trainer \
   && echo "  ✓ uav-trainer image OK" \
-  || { echo "  ✗ uav-trainer image missing. Run: docker build -t uav-trainer:latest . && docker save uav-trainer:latest | sudo k3s ctr images import -"; exit 1; }
+  || { echo "  ✗ uav-trainer image missing. Run Bước 9 from SETUP.md:"; \
+       echo "      docker build -t uav-trainer:latest ."; \
+       echo "      docker tag uav-trainer:latest localhost:5001/uav-trainer:latest"; \
+       echo "      docker push localhost:5001/uav-trainer:latest"; \
+       echo "      sudo k3s ctr images pull --plain-http localhost:5001/uav-trainer:latest"; \
+       exit 1; }
 echo ""
 
 # ── Generate mock data ────────────────────────────────────────────────────────
@@ -43,23 +49,27 @@ echo ""
 
 # ── Start consumers ───────────────────────────────────────────────────────────
 echo "[2] Starting consumers (background)..."
-python3 -m consumers.uc1_frame_processor > /tmp/uc1.log 2>&1 &
-UC1_PID=$!
-echo "  UC1 PID: $UC1_PID  (tail /tmp/uc1.log)"
-
-python3 -m consumers.uc2_checkpoint_validator > /tmp/uc2.log 2>&1 &
+python3 -m consumers.model_trainer > /tmp/model_trainer.log 2>&1 &
 UC2_PID=$!
-echo "  UC2 PID: $UC2_PID  (tail /tmp/uc2.log)"
+echo "  model_trainer PID: $UC2_PID  (tail /tmp/model_trainer.log)"
 
-echo "  Waiting 5s for consumers to connect..."
+echo "  Waiting 5s for consumer to connect..."
 sleep 5
 echo ""
 
-# ── Run UC3 simulator ─────────────────────────────────────────────────────────
-echo "[3] Starting UC3 Simulator (foreground)..."
-echo "    Watching for: memory_hit | slow | medium | fast | skip"
+# ── Run flight_agent — one terrain at a time ─────────────────────────────────
+# Each terrain trains a separate model: uav-navigator-{terrain}
+# To demo a specific terrain:  FLIGHT_TERRAIN=mountain bash scripts/demo.sh
+#
+# Available terrains: urban | forest | desert | coastal | mountain
+
+TERRAIN="${FLIGHT_TERRAIN:-mountain}"
+
+echo "[3] Starting flight_agent | terrain=${TERRAIN}"
+echo "    Model will be registered as: uav-navigator-${TERRAIN}"
+echo "    (change terrain: FLIGHT_TERRAIN=forest bash scripts/demo.sh)"
 echo "------------------------------------------------------------"
-python3 -m simulator.uc3_simulator
+FLIGHT_TERRAIN="${TERRAIN}" python3 -m simulator.flight_agent
 echo "------------------------------------------------------------"
 echo ""
 
@@ -68,39 +78,39 @@ echo "[4] Results..."
 
 echo ""
 echo "  --- Ceph Buckets ---"
-for bucket in raw-frames embeddings checkpoints mlflow-artifacts; do
+for bucket in checkpoints training-data mlflow-artifacts fast-weight-state; do
   count=$(aws --endpoint-url http://localhost:7480 s3 ls s3://$bucket/ --recursive 2>/dev/null | wc -l | tr -d ' ')
-  printf "  %-18s %s objects\n" "$bucket:" "$count"
+  printf "  %-22s %s objects\n" "$bucket:" "$count"
 done
 
 echo ""
 echo "  --- MLflow ---"
 python3 - <<'PYEOF'
 import mlflow
+from mlflow import MlflowClient
 mlflow.set_tracking_uri("http://localhost:5000")
-runs = mlflow.search_runs(order_by=["start_time DESC"], max_results=3)
+client = MlflowClient()
+try:
+    exp_ids = [e.experiment_id for e in client.search_experiments()]
+except Exception:
+    exp_ids = ["0"]
+runs = mlflow.search_runs(experiment_ids=exp_ids, order_by=["start_time DESC"], max_results=3)
 if runs.empty:
-    print("  No runs yet (UC2 may still be processing)")
+    print("  No runs yet (model_trainer may still be processing)")
 else:
     for _, r in runs.iterrows():
         print(f"  Run: {r['run_id'][:8]}...  acc={r.get('metrics.accuracy','?')}  lat={r.get('metrics.latency_p95','?')}ms")
 PYEOF
 
 echo ""
-echo "  --- KServe ---"
-kubectl get inferenceservice uav-navigator 2>/dev/null || echo "  (not yet updated)"
-
-echo ""
-echo "  --- Consumer logs (last 5 lines each) ---"
-echo "  [UC1]:"
-tail -5 /tmp/uc1.log 2>/dev/null | sed 's/^/    /'
-echo "  [UC2]:"
-tail -5 /tmp/uc2.log 2>/dev/null | sed 's/^/    /'
+echo "  --- Consumer logs (last 5 lines) ---"
+echo "  [model_trainer]:"
+tail -5 /tmp/model_trainer.log 2>/dev/null | sed 's/^/    /'
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "[5] Stopping consumers..."
-kill $UC1_PID $UC2_PID 2>/dev/null || true
+kill $UC2_PID 2>/dev/null || true
 
 echo ""
 echo "============================================================"
