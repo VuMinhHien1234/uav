@@ -353,6 +353,15 @@ Muốn đổi terrain:
 FLIGHT_TERRAIN=forest bash scripts/demo.sh
 ```
 
+> **Lưu ý với mock data (random noise images):** ResNet18 extract features rất giống nhau trên noise → surprise thấp → hầu hết SKIP. Dùng threshold thấp hơn để demo đủ fast/medium/slow:
+> ```bash
+> NL_FAST_DELTA=0.0004 \
+> NL_MEDIUM_DELTA=0.0007 \
+> NL_SLOW_ACCUMULATOR=0.015 \
+> FLIGHT_TERRAIN=forest \
+> bash scripts/demo.sh
+> ```
+
 ---
 
 ### Demo B — Chạy thủ công từng bước (khuyến nghị khi thuyết trình)
@@ -438,15 +447,31 @@ aws --endpoint-url http://localhost:7480 s3 ls s3://checkpoints/ --recursive
 aws --endpoint-url http://localhost:7480 s3 ls s3://fast-weight-state/ --recursive
 ```
 
-### Xem MLflow từ Mac (SSH tunnel)
+### Xem MLflow + Ceph dashboard từ Mac (SSH tunnel)
+
+> ⚠️ Chạy lệnh dưới đây **trên Mac**, không phải trên VM.
 
 ```bash
-# Chạy trên Mac
-ssh -i ~/.ssh/gcp_uav -L 5000:localhost:5000 -L 8443:localhost:8443 \
-  YOUR_VM_USERNAME@VM_EXTERNAL_IP -N
+# Mở terminal Mac (không phải SSH session vào VM)
+ssh -i ~/.ssh/gcp_uav \
+  -L 5000:localhost:5000 \
+  -L 8443:localhost:8443 \
+  -N YOUR_VM_USERNAME@VM_EXTERNAL_IP
 ```
 
-Sau đó mở `http://localhost:5000` trên Mac.
+- `-L 5000:localhost:5000` — forward MLflow UI
+- `-L 8443:localhost:8443` — forward Ceph dashboard
+- `-N` — không mở shell, chỉ giữ tunnel (giữ terminal này mở)
+
+Sau đó mở browser trên Mac:
+
+| URL | Nội dung |
+|-----|----------|
+| `http://localhost:5000` | MLflow UI — xem runs, metrics, model registry |
+| `https://localhost:8443` | Ceph dashboard — xem OSD, buckets (admin / adminpassword) |
+
+> Tunnel hoạt động khi terminal đó còn mở. Đóng terminal = mất tunnel.
+> Để chạy nền: thêm flag `-f` vào lệnh ssh.
 
 ---
 
@@ -524,6 +549,24 @@ sudo chmod 644 /etc/rancher/k3s/k3s.yaml
 kubectl get nodes
 ```
 
+> ⚠️ Sau mỗi lần **tắt/bật VM**, k3s tự start nhưng file kubeconfig bị reset về permission root-only.
+> Phải chạy lại `sudo chmod 644 /etc/rancher/k3s/k3s.yaml` trước khi dùng `kubectl`.
+
+**Khởi động lại toàn bộ sau khi bật VM:**
+```bash
+# 1. Fix kubectl permission (bắt buộc mỗi lần reboot)
+sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+
+# 2. Start Kafka + MLflow (k3s và Ceph tự start qua systemd)
+cd ~/uav && docker-compose up -d
+
+# 3. Verify tất cả đều chạy
+kubectl get nodes          # k3s Ready
+docker-compose ps          # kafka, zookeeper, mlflow Up
+curl http://localhost:7480 # Ceph RadosGW XML response
+curl http://localhost:5000/health # MLflow OK
+```
+
 **uav-trainer image không tìm thấy trong k3s:**
 ```bash
 # Push lại vào local registry
@@ -531,6 +574,22 @@ docker push localhost:5001/uav-trainer:latest
 sudo k3s ctr images pull --plain-http localhost:5001/uav-trainer:latest
 sudo k3s ctr images ls | grep uav-trainer
 ```
+
+---
+
+## Thông tin tài khoản
+
+| Service | Username | Password / Key |
+|---------|----------|----------------|
+| Ceph dashboard (`https://localhost:8443`) | `admin` | `adminpassword` (set thủ công — xem bên dưới) |
+| Ceph S3 (RadosGW) — access key | `uavaccess` | — |
+| Ceph S3 (RadosGW) — secret key | `uavsecret123` | — |
+| Ceph S3 user (radosgw-admin) | `uavuser` | — |
+
+> Ceph dashboard tự generate password lúc bootstrap — phải đổi thủ công:
+> ```bash
+> echo "adminpassword" | sudo cephadm shell -- ceph dashboard ac-user-set-password admin -i -
+> ```
 
 ---
 

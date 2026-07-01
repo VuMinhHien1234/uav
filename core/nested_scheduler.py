@@ -32,15 +32,7 @@ class NestedLearningScheduler:
         self.last_combined: torch.Tensor | None = None
 
     def decide(self, current_features: torch.Tensor, frame_id: str = None):
-        """
-        Xử lý một frame:
-          1. Truy hồi từ Titans memory + cập nhật gradient tại chỗ (inner loop).
-          2. Xây dựng vector tổng hợp: input + recall.
-          3. Phân loại mức độ theo surprise score (thay thế cosine delta).
-          4. Tích lũy drift để kích hoạt slow trigger.
 
-        Trả về (level, debug_dict) — API giữ nguyên so với phiên bản Hebbian.
-        """
         x = current_features.float().squeeze()
 
         # Inner loop: recall + gradient update, returns (combined_recall, surprise)

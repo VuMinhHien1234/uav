@@ -1,0 +1,317 @@
+---
+# UAV Nested Learning Pipeline — Ansible Playbook
+# Tự động setup toàn bộ infrastructure trên GCP Ubuntu VM
+#
+# Chạy: ansible-playbook -i inventory.ini playbook.yml
+#
+# Yêu cầu trên VM: Ubuntu 22.04, 3 disk trống (/dev/sdb, /dev/sdc, /dev/sdd)
+# Yêu cầu trên Mac: ansible >= 2.14, community.docker collection
+
+- name: UAV Pipeline — Full Setup
+  hosts: uav_vm
+  become: yes
+  vars:
+    vm_user: "{{ ansible_user }}"
+    project_dir: "/home/{{ ansible_user }}/uav"
+    git_repo: "https://github.com/YOUR_USERNAME/uav-pipeline.git"
+    ceph_mon_ip: "{{ ansible_default_ipv4.address }}"
+    s3_access_key: "uavaccess"
+    s3_secret_key: "uavsecret123"
+    dashboard_password: "adminpassword"
+    ceph_osd_disks:
+      - /dev/sdb
+      - /dev/sdc
+      - /dev/sdd
+
+  # ── BƯỚC 1: Cài system dependencies ─────────────────────────────────────
+  tasks:
+    - name: "[1/8] Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "[1/8] Install system packages"
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3-pip
+          - git
+          - curl
+          - wget
+          - unzip
+        state: present
+
+    - name: "[1/8] Install Docker"
+      shell: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: "[1/8] Add user to docker group"
+      user:
+        name: "{{ vm_user }}"
+        groups: docker
+        append: yes
+
+    - name: "[1/8] Install Docker Compose"
+      get_url:
+        url: "https://github.com/docker/compose/releases/latest/download/docker-compose-Linux-x86_64"
+        dest: /usr/local/bin/docker-compose
+        mode: "0755"
+
+    - name: "[1/8] Download AWS CLI"
+      get_url:
+        url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+        dest: /tmp/awscliv2.zip
+
+    - name: "[1/8] Unzip AWS CLI"
+      unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp/
+        remote_src: yes
+
+    - name: "[1/8] Install AWS CLI"
+      shell: /tmp/aws/install --update
+      args:
+        creates: /usr/local/bin/aws
+
+    - name: "[1/8] Download cephadm"
+      get_url:
+        url: https://github.com/ceph/ceph/raw/quincy/src/cephadm/cephadm
+        dest: /usr/local/bin/cephadm
+        mode: "0755"
+
+  # ── BƯỚC 2: Bootstrap Ceph ──────────────────────────────────────────────
+    - name: "[2/8] Bootstrap Ceph single-node"
+      shell: |
+        cephadm bootstrap \
+          --mon-ip {{ ceph_mon_ip }} \
+          --initial-dashboard-user admin \
+          --initial-dashboard-password {{ dashboard_password }} \
+          --skip-monitoring-stack \
+          --single-host-defaults
+      args:
+        creates: /var/lib/ceph
+
+    - name: "[2/8] Wait for Ceph MON to stabilize"
+      pause:
+        seconds: 45
+
+    - name: "[2/8] Add OSDs"
+      shell: "cephadm shell -- ceph orch daemon add osd $(hostname):{{ item }}"
+      loop: "{{ ceph_osd_disks }}"
+      ignore_errors: yes
+
+    - name: "[2/8] Wait for OSDs to come up"
+      pause:
+        seconds: 30
+
+    - name: "[2/8] Enable RadosGW on port 7480"
+      shell: cephadm shell -- ceph orch apply rgw default --port 7480
+
+    - name: "[2/8] Wait for RadosGW"
+      pause:
+        seconds: 30
+
+    - name: "[2/8] Set Ceph dashboard password"
+      shell: echo "{{ dashboard_password }}" | cephadm shell -- ceph dashboard ac-user-set-password admin -i -
+
+    - name: "[2/8] Verify RadosGW responds"
+      uri:
+        url: http://localhost:7480
+        status_code: [200, 403]
+      retries: 6
+      delay: 10
+
+  # ── BƯỚC 3: Clone repo + Python venv ────────────────────────────────────
+    - name: "[3/8] Clone UAV pipeline repo"
+      git:
+        repo: "{{ git_repo }}"
+        dest: "{{ project_dir }}"
+        force: yes
+      become_user: "{{ vm_user }}"
+
+    - name: "[3/8] Create Python venv"
+      shell: python3.11 -m venv {{ project_dir }}/venv
+      become_user: "{{ vm_user }}"
+      args:
+        creates: "{{ project_dir }}/venv/bin/activate"
+
+    - name: "[3/8] Install Python dependencies"
+      shell: "{{ project_dir }}/venv/bin/pip install --upgrade pip && {{ project_dir }}/venv/bin/pip install -r {{ project_dir }}/requirements.txt"
+      become_user: "{{ vm_user }}"
+
+  # ── BƯỚC 4: Docker Compose (Kafka + MLflow + Kafka UI + Filestash) ──────
+    - name: "[4/8] Update docker-compose with VM IP"
+      replace:
+        path: "{{ project_dir }}/docker-compose.yml"
+        regexp: 'http://host\.docker\.internal:7480'
+        replace: "http://{{ ceph_mon_ip }}:7480"
+
+    - name: "[4/8] Start Docker Compose services"
+      shell: docker-compose up -d
+      args:
+        chdir: "{{ project_dir }}"
+      become_user: "{{ vm_user }}"
+
+    - name: "[4/8] Wait for MLflow to be ready"
+      uri:
+        url: http://localhost:5000/health
+        status_code: 200
+      retries: 12
+      delay: 5
+
+  # ── BƯỚC 5: Ceph S3 user + 4 buckets ───────────────────────────────────
+    - name: "[5/8] Create Ceph S3 user"
+      shell: |
+        cephadm shell -- radosgw-admin user create \
+          --uid=uavuser \
+          --display-name="UAV Pipeline User" \
+          --access-key={{ s3_access_key }} \
+          --secret={{ s3_secret_key }} 2>/dev/null || true
+
+    - name: "[5/8] Configure AWS CLI credentials"
+      shell: |
+        aws configure set aws_access_key_id {{ s3_access_key }}
+        aws configure set aws_secret_access_key {{ s3_secret_key }}
+        aws configure set default.region us-east-1
+        aws configure set default.output json
+      become_user: "{{ vm_user }}"
+
+    - name: "[5/8] Create S3 buckets"
+      shell: "aws --endpoint-url http://localhost:7480 s3 mb s3://{{ item }} 2>/dev/null || true"
+      become_user: "{{ vm_user }}"
+      loop:
+        - checkpoints
+        - training-data
+        - mlflow-artifacts
+        - fast-weight-state
+
+  # ── BƯỚC 6: k3s + K8s secrets ───────────────────────────────────────────
+    - name: "[6/8] Create k3s config directory"
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: "[6/8] Configure k3s local registry mirror"
+      copy:
+        dest: /etc/rancher/k3s/registries.yaml
+        content: |
+          mirrors:
+            "localhost:5001":
+              endpoint:
+                - "http://localhost:5001"
+
+    - name: "[6/8] Install k3s"
+      shell: curl -sfL https://get.k3s.io | sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: "[6/8] Enable and start k3s"
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+
+    - name: "[6/8] Fix kubeconfig permissions (and on every reboot)"
+      file:
+        path: /etc/rancher/k3s/k3s.yaml
+        mode: "0644"
+
+    - name: "[6/8] Create systemd service to fix permissions on reboot"
+      copy:
+        dest: /etc/systemd/system/fix-k3s-permissions.service
+        content: |
+          [Unit]
+          Description=Fix k3s kubeconfig permissions after boot
+          After=k3s.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/chmod 644 /etc/rancher/k3s/k3s.yaml
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: "[6/8] Enable permission-fix service"
+      systemd:
+        name: fix-k3s-permissions
+        enabled: yes
+        daemon_reload: yes
+
+    - name: "[6/8] Copy kubeconfig to user home"
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ vm_user }}/.kube/config"
+        owner: "{{ vm_user }}"
+        remote_src: yes
+      become: yes
+
+    - name: "[6/8] Wait for k3s node to be Ready"
+      shell: kubectl get nodes --no-headers | grep -c Ready
+      register: node_ready
+      until: node_ready.stdout | int >= 1
+      retries: 18
+      delay: 10
+      become_user: "{{ vm_user }}"
+      environment:
+        KUBECONFIG: "/home/{{ vm_user }}/.kube/config"
+
+    - name: "[6/8] Create K8s secret for Ceph + MLflow"
+      shell: |
+        kubectl delete secret ceph-s3-secret 2>/dev/null || true
+        kubectl create secret generic ceph-s3-secret \
+          --from-literal=AWS_ACCESS_KEY_ID={{ s3_access_key }} \
+          --from-literal=AWS_SECRET_ACCESS_KEY={{ s3_secret_key }} \
+          --from-literal=MLFLOW_S3_ENDPOINT_URL=http://{{ ceph_mon_ip }}:7480 \
+          --from-literal=MLFLOW_TRACKING_URI=http://{{ ceph_mon_ip }}:5000
+      become_user: "{{ vm_user }}"
+      environment:
+        KUBECONFIG: "/home/{{ vm_user }}/.kube/config"
+
+  # ── BƯỚC 7: Build + push Docker image ───────────────────────────────────
+    - name: "[7/8] Start local Docker registry"
+      shell: |
+        docker start local-registry 2>/dev/null || \
+        docker run -d -p 5001:5000 --name local-registry --restart=unless-stopped registry:2
+
+    - name: "[7/8] Build uav-trainer image"
+      shell: docker build -t uav-trainer:latest {{ project_dir }}
+
+    - name: "[7/8] Tag image for local registry"
+      shell: docker tag uav-trainer:latest localhost:5001/uav-trainer:latest
+
+    - name: "[7/8] Push image to local registry"
+      shell: docker push localhost:5001/uav-trainer:latest
+
+    - name: "[7/8] Pull image into k3s containerd"
+      shell: k3s ctr images pull --plain-http localhost:5001/uav-trainer:latest
+
+  # ── BƯỚC 8: Generate mock data ───────────────────────────────────────────
+    - name: "[8/8] Generate mock UAV frames"
+      shell: "{{ project_dir }}/venv/bin/python3 {{ project_dir }}/scripts/download_mock_data.py"
+      become_user: "{{ vm_user }}"
+      environment:
+        PYTHONPATH: "{{ project_dir }}"
+
+    - name: "Setup complete!"
+      debug:
+        msg: |
+          ✓ Ceph RadosGW   → http://{{ ceph_mon_ip }}:7480
+          ✓ Ceph Dashboard → https://{{ ceph_mon_ip }}:8443  (admin / {{ dashboard_password }})
+          ✓ MLflow UI      → http://{{ ceph_mon_ip }}:5000
+          ✓ Kafka UI       → http://{{ ceph_mon_ip }}:8080
+          ✓ Filestash      → http://{{ ceph_mon_ip }}:8334
+
+          SSH tunnel từ Mac:
+            ssh -i ~/.ssh/gcp_uav \
+              -L 5000:localhost:5000 \
+              -L 8080:localhost:8080 \
+              -L 8334:localhost:8334 \
+              -L 8443:localhost:8443 \
+              -N {{ ansible_user }}@{{ ansible_host }}
+
+          Chạy demo:
+            cd {{ project_dir }} && source venv/bin/activate
+            bash scripts/demo.sh

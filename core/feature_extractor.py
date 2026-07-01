@@ -20,14 +20,6 @@ _TRANSFORM = transforms.Compose([
 
 
 def _find_best_version(versions):
-    """
-    Select the best registered model version by stage priority.
-
-    Priority: Production > Staging > highest version number.
-
-    Rationale: model_trainer promotes validated models through Staging → Production.
-    Loading "latest version number" would pull in a model that hasn't been validated yet.
-    """
     for stage in ("Production", "Staging"):
         staged = [v for v in versions if v.current_stage == stage]
         if staged:

@@ -18,7 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("model_trainer")
 
-# MLflow env setup
 os.environ["MLFLOW_S3_ENDPOINT_URL"] = settings.MLFLOW_S3_ENDPOINT
 os.environ["AWS_ACCESS_KEY_ID"]      = settings.S3_ACCESS_KEY
 os.environ["AWS_SECRET_ACCESS_KEY"]  = settings.S3_SECRET_KEY
@@ -30,12 +29,8 @@ client = MlflowClient()
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _K8S_JOB_YAML = os.path.join(_PROJECT_ROOT, "k8s", "training_job.yaml")
 
-# ── Kafka deduplication ────────────────────────────────────────────────────
-# In-process set of checkpoint keys already processed this session.
-# Prevents duplicate K8s jobs when flight_agent retries a Kafka publish.
-# Note: this resets on consumer restart — for cross-restart dedup, persist to Redis/DB.
+# ── Kafka deduplication ──────────────────────────────────────────────
 _seen_keys: set[str] = set()
-
 
 def spawn_k8s_training_job(job_id: str, level: str, checkpoint_key: str, terrain: str):
     with open(_K8S_JOB_YAML) as f:
