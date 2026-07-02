@@ -75,10 +75,11 @@ class TitansMemory:
       cleanup_old_states(days)  — delete .pt files older than N days
     """
 
-    def __init__(self, terrain: str = None, embed_dim: int = None):
-        self.s3      = make_s3_client()
-        self.terrain = terrain or settings.FLIGHT_TERRAIN
-        dim          = embed_dim or settings.NL_EMBED_DIM
+    def __init__(self, terrain: str = None, embed_dim: int = None, flight_id: int = None):
+        self.s3        = make_s3_client()
+        self.terrain   = terrain or settings.FLIGHT_TERRAIN
+        self.flight_id = flight_id or int(time.time())
+        dim            = embed_dim or settings.NL_EMBED_DIM
 
         self.fast = _TitansScale(dim, lr=settings.TITANS_LR_FAST,  forget=settings.NL_ALPHA_FAST)
         self.med  = _TitansScale(dim, lr=settings.TITANS_LR_MED,   forget=settings.NL_ALPHA_MEDIUM)
@@ -125,15 +126,22 @@ class TitansMemory:
 
     def save_to_ceph(self):
         """
-        Persist W matrices to Ceph.
-        Saves two objects:
-          terrain_{t}/{timestamp}.pt  — immutable snapshot (for rollback / audit)
-          terrain_{t}/latest.pt       — always the most recent state (S3 last-write-wins)
+        Persist this flight's W matrices to Ceph under a key unique to this
+        flight: terrain_{t}/flight_{flight_id}.pt.
 
-        Note on multi-UAV race: if two UAVs with the same terrain write concurrently,
-        latest.pt is last-write-wins (S3 put_object is atomic, so no corruption —
-        at worst one flight's update is overwritten). Acceptable for demo scale.
-        For fleet production, scope latest.pt per flight_id and add an aggregation step.
+        Previously this wrote directly to terrain_{t}/latest.pt (last-write-
+        wins): if two UAVs flying the same terrain saved concurrently, one
+        flight's accumulated learning was silently overwritten by the other's
+        — a race condition called out as an accepted limitation in earlier
+        versions of this file. Writing to a per-flight key removes the race
+        at the write level entirely — no two flights ever touch the same
+        object, so there's nothing to overwrite.
+
+        A separate aggregation step (core/titans_aggregate.py, run
+        periodically by consumers/model_trainer_watcher.py) merges every
+        flight's per-flight state for a terrain into a consolidated
+        terrain_{t}/latest.pt, which is what _load_from_ceph() reads at the
+        start of the next flight.
         """
         state = {
             "W_fast": self.fast.W,
@@ -143,31 +151,31 @@ class TitansMemory:
         buf  = io.BytesIO()
         torch.save(state, buf)
         data = buf.getvalue()
-        ts   = int(time.time())
         pfx  = self._ceph_prefix()
+        key  = f"{pfx}/flight_{self.flight_id}.pt"
 
         try:
-            for key in (f"{pfx}/{ts}.pt", f"{pfx}/latest.pt"):
-                self.s3.put_object(
-                    Bucket=settings.BUCKET_FAST_WEIGHT,
-                    Key=key,
-                    Body=data,
-                    ContentType="application/octet-stream",
-                )
+            self.s3.put_object(
+                Bucket=settings.BUCKET_FAST_WEIGHT,
+                Key=key,
+                Body=data,
+                ContentType="application/octet-stream",
+            )
             logger.info(
-                f"Titans saved → {pfx}/{ts}.pt  terrain={self.terrain}  "
+                f"Titans saved → {key}  terrain={self.terrain}  "
                 f"W_fast={self.fast.norm}  W_med={self.med.norm}  W_slow={self.slow.norm}"
             )
-            # Cleanup old snapshots after every save
+            # Cleanup old per-flight snapshots after every save (this flight's own)
             self.cleanup_old_states(keep_days=7)
         except Exception as e:
             logger.warning(f"Failed to save Titans memory to Ceph: {e}")
 
     def cleanup_old_states(self, keep_days: int = 7):
         """
-        Delete timestamped .pt files older than keep_days from Ceph.
-        Skips latest.pt (always kept).
-        Prevents unbounded growth of fast-weight-state bucket.
+        Delete per-flight .pt files (terrain_{t}/flight_{id}.pt) older than
+        keep_days from Ceph. Skips latest.pt (the aggregator's consolidated
+        output, always kept). Prevents unbounded growth of the
+        fast-weight-state bucket as more flights accumulate.
         """
         cutoff = int(time.time()) - keep_days * 86400
         pfx    = self._ceph_prefix()
@@ -179,8 +187,12 @@ class TitansMemory:
             for obj in resp.get("Contents", []):
                 key = obj["Key"]
                 if key.endswith("latest.pt"):
-                    continue  # always keep
-                fname = key.split("/")[-1].replace(".pt", "")
+                    continue  # always keep — this is the aggregator's output
+                fname = key.split("/")[-1]
+                if fname.startswith("flight_") and fname.endswith(".pt"):
+                    fname = fname[len("flight_"):-len(".pt")]
+                else:
+                    fname = fname.replace(".pt", "")
                 try:
                     ts = int(fname)
                     if ts < cutoff:
@@ -196,6 +208,8 @@ class TitansMemory:
             logger.debug(f"Cleanup skipped: {e}")
 
     def _load_from_ceph(self):
+        # latest.pt is written only by the aggregator (core/titans_aggregate.py),
+        # never directly by a flight — see save_to_ceph() above.
         key = f"{self._ceph_prefix()}/latest.pt"
         try:
             obj    = self.s3.get_object(Bucket=settings.BUCKET_FAST_WEIGHT, Key=key)

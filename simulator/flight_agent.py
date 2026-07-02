@@ -1,9 +1,12 @@
 
 import glob
+import io
 import json
 import logging
 import os
 import time
+
+from PIL import Image
 
 from config import settings
 from core.feature_extractor import FeatureExtractor
@@ -26,15 +29,35 @@ LEVEL_ICON = {
 
 # ── S3 helpers ────────────────────────────────────────────────────────────────
 
+def _strip_metadata(img_path: str) -> bytes:
+    """
+    Re-encode the frame before it leaves the UAV, stripping EXIF metadata
+    (GPS coordinates, device serial, capture timestamp).
+
+    Aerial imagery EXIF can leak the flight path / location of the UAV even
+    when the visual content itself (terrain) is not sensitive. Re-saving via
+    PIL without passing `exif=` drops all EXIF tags while keeping full pixel
+    data intact — so this does NOT affect training (backbone still sees the
+    same image content, only the metadata sidecar is gone).
+
+    Note: this only strips metadata. It does not blur faces/plates in the
+    image content itself — see the "urban terrain" caveat if that's needed.
+    """
+    img = Image.open(img_path).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)  # no exif= kwarg -> EXIF dropped
+    return buf.getvalue()
+
+
 def _upload_frame(s3, img_path: str, frame_id: str, flight_id: int, terrain: str) -> str:
     key = f"frames/terrain_{terrain}/flight_{flight_id}/{frame_id}.jpg"
-    with open(img_path, "rb") as f:
-        s3.put_object(
-            Bucket=settings.BUCKET_TRAINING_DATA,
-            Key=key,
-            Body=f.read(),
-            ContentType="image/jpeg",
-        )
+    data = _strip_metadata(img_path)
+    s3.put_object(
+        Bucket=settings.BUCKET_TRAINING_DATA,
+        Key=key,
+        Body=data,
+        ContentType="image/jpeg",
+    )
     return key
 
 
@@ -117,7 +140,10 @@ def main():
     s3        = make_s3_client()
     producer  = make_producer()
     extractor = FeatureExtractor(terrain=flight_terrain)
-    scheduler = NestedLearningScheduler(terrain=flight_terrain)
+    # flight_id is passed through so TitansMemory.save_to_ceph() writes this
+    # flight's state to its own key (terrain_{t}/flight_{flight_id}.pt)
+    # instead of racing with other concurrent flights over a shared latest.pt.
+    scheduler = NestedLearningScheduler(terrain=flight_terrain, flight_id=flight_id)
 
     frame_paths      = _get_mock_frames(flight_terrain)
     checkpoint_count = 0

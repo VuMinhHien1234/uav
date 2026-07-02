@@ -16,6 +16,7 @@ mlflow.db
 /tmp/
 *.log
 *.pt.tmp
+kafka_pending_events.jsonl
 
 # K8s generated jobs
 k8s_jobs/

@@ -47,13 +47,21 @@ echo "[1] Generating mock frames..."
 python3 scripts/download_mock_data.py
 echo ""
 
-# ── Start consumers ───────────────────────────────────────────────────────────
-echo "[2] Starting consumers (background)..."
+# ── Start consumer + watcher ──────────────────────────────────────────────────
+# These are 2 separate processes now: model_trainer.py only spawns K8s Jobs
+# (fast, never blocks); model_trainer_watcher.py polls those Jobs to
+# completion and does the actual MLflow validate/promote step. Both must be
+# running or spawned jobs will never get promoted — see consumers/_trainer_common.py.
+echo "[2] Starting consumer + watcher (background)..."
 python3 -m consumers.model_trainer > /tmp/model_trainer.log 2>&1 &
 UC2_PID=$!
 echo "  model_trainer PID: $UC2_PID  (tail /tmp/model_trainer.log)"
 
-echo "  Waiting 5s for consumer to connect..."
+python3 -m consumers.model_trainer_watcher > /tmp/model_trainer_watcher.log 2>&1 &
+WATCHER_PID=$!
+echo "  model_trainer_watcher PID: $WATCHER_PID  (tail /tmp/model_trainer_watcher.log)"
+
+echo "  Waiting 5s for consumer + watcher to connect..."
 sleep 5
 echo ""
 
@@ -84,6 +92,10 @@ for bucket in checkpoints training-data mlflow-artifacts fast-weight-state; do
 done
 
 echo ""
+echo "  NOTE: promotion now happens asynchronously via model_trainer_watcher.py"
+echo "  (polls every 15s + waits for the K8s Job to finish) — if no runs show up"
+echo "  yet below, wait ~30-60s and re-check MLflow, it hasn't failed."
+echo ""
 echo "  --- MLflow ---"
 python3 - <<'PYEOF'
 import mlflow
@@ -103,14 +115,17 @@ else:
 PYEOF
 
 echo ""
-echo "  --- Consumer logs (last 5 lines) ---"
+echo "  --- Consumer / watcher logs (last 5 lines each) ---"
 echo "  [model_trainer]:"
 tail -5 /tmp/model_trainer.log 2>/dev/null | sed 's/^/    /'
+echo "  [model_trainer_watcher]:"
+tail -5 /tmp/model_trainer_watcher.log 2>/dev/null | sed 's/^/    /'
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 echo ""
-echo "[5] Stopping consumers..."
+echo "[5] Stopping consumer + watcher..."
 kill $UC2_PID 2>/dev/null || true
+kill $WATCHER_PID 2>/dev/null || true
 
 echo ""
 echo "============================================================"

@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 class NestedLearningScheduler:
 
-    def __init__(self, terrain: str = None):
-        self.memory            = TitansMemory(terrain=terrain)
+    def __init__(self, terrain: str = None, flight_id: int = None):
+        self.memory            = TitansMemory(terrain=terrain, flight_id=flight_id)
         self.drift_accumulator = 0.0
         self.last_combined: torch.Tensor | None = None
 

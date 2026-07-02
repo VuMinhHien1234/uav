@@ -1,5 +1,14 @@
 version: '3.8'
 
+# Multi-node notes:
+# This same file is deployed identically to all 3 VMs in a hyper-converged
+# cluster (see ansible/playbook.yml) — each VM runs its own zookeeper +
+# kafka broker pair. Per-host values (broker id, this node's advertised
+# address, the full ZK ensemble connect string) come from environment
+# variables so Ansible can template a `.env` per host; sensible single-node
+# defaults are kept below so `docker-compose up -d` alone still works
+# unchanged for anyone not doing the 3-VM setup.
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -7,8 +16,15 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+      # Only meaningful once >1 ZK node exists (3-VM setup). ZOOKEEPER_SERVER_ID
+      # must be unique per host (1, 2, 3); ZOOKEEPER_SERVERS lists all of them,
+      # e.g. "server.1=vm1-ip:2888:3888;server.2=vm2-ip:2888:3888;server.3=vm3-ip:2888:3888"
+      ZOOKEEPER_SERVER_ID: ${ZOOKEEPER_SERVER_ID:-1}
+      ZOOKEEPER_SERVERS: ${ZOOKEEPER_SERVERS:-server.1=0.0.0.0:2888:3888}
     ports:
       - "2181:2181"
+      - "2888:2888"
+      - "3888:3888"
     restart: unless-stopped
 
   kafka:
@@ -20,23 +36,70 @@ services:
       - "9092:9092"
       - "29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Unique per host in the 3-VM setup (1, 2, 3); defaults to 1 for single-node.
+      KAFKA_BROKER_ID: ${KAFKA_BROKER_ID:-1}
+      # In the 3-VM setup this lists all 3 ZK nodes: zk1-ip:2181,zk2-ip:2181,zk3-ip:2181
+      KAFKA_ZOOKEEPER_CONNECT: ${KAFKA_ZOOKEEPER_CONNECT:-zookeeper:2181}
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      # KAFKA_ADVERTISED_HOST must be this VM's real internal IP in the 3-VM
+      # setup, not "localhost" — otherwise external clients can't reach it.
+      #
+      # KAFKA_ADVERTISED_INTERNAL_HOST is the one that matters for inter-broker
+      # replication across 3 VMs, and defaulting it to "kafka" (docker-internal
+      # hostname) would be a real bug in the multi-VM case: broker on VM2
+      # resolving "kafka" would hit its OWN local container, not VM1's — so
+      # replication traffic would never actually leave each machine. Ansible
+      # sets this to the VM's real IP per host; single-node default "kafka"
+      # is kept only for the docker-compose-only (1 VM) path.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${KAFKA_ADVERTISED_HOST:-localhost}:9092,INTERNAL://${KAFKA_ADVERTISED_INTERNAL_HOST:-kafka}:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # 3 in the 3-VM setup (matches 3 brokers' replication); 1 only valid single-node.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:-1}
+      KAFKA_DEFAULT_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Raise from 1 once there's more than one consumer instance, so Kafka
+      # actually has partitions to split across them.
+      KAFKA_NUM_PARTITIONS: ${KAFKA_NUM_PARTITIONS:-1}
+    restart: unless-stopped
+
+  postgres:
+    # IMPORTANT — do not run this service on all 3 VMs in the hyper-converged
+    # setup: 3 independent `postgres` containers would be 3 separate,
+    # unsynchronized databases, not one shared metadata store (Postgres has
+    # no equivalent of Ceph/Kafka/k3s's built-in clustering — replicating it
+    # properly needs Patroni/repmgr, a 4th distributed system to operate).
+    # Two supported options instead:
+    #   (a) recommended: skip this service on every host, point
+    #       MLFLOW_BACKEND_STORE_URI at a managed Cloud SQL instance from
+    #       all 3 MLflow containers — see ansible/playbook.yml.
+    #   (b) self-hosted, non-HA: enable this service on exactly ONE of the
+    #       3 hosts, and point all 3 MLflow containers' MLFLOW_BACKEND_STORE_URI
+    #       at that one host's IP. This centralizes the metadata store (fixes
+    #       the "3 disconnected DBs" problem) but that one host is then a
+    #       single point of failure for MLflow specifically — same caveat as
+    #       running MLflow itself on a single VM.
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflowpassword}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     restart: unless-stopped
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow
+    depends_on:
+      - postgres
     ports:
       - "5000:5000"
     environment:
-      MLFLOW_S3_ENDPOINT_URL: http://host.docker.internal:7480
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:-http://host.docker.internal:7480}
       AWS_ACCESS_KEY_ID: uavaccess
       AWS_SECRET_ACCESS_KEY: uavsecret123
       AWS_DEFAULT_REGION: us-east-1
@@ -44,10 +107,8 @@ services:
       mlflow server
       --host 0.0.0.0
       --port 5000
-      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --backend-store-uri ${MLFLOW_BACKEND_STORE_URI:-postgresql://mlflow:mlflowpassword@postgres:5432/mlflow}
       --default-artifact-root s3://mlflow-artifacts/
-    volumes:
-      - mlflow-data:/mlflow
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -74,4 +135,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  mlflow-data:
+  postgres-data:

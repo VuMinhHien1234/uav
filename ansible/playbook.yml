@@ -1,176 +1,293 @@
 ---
-# UAV Nested Learning Pipeline — Ansible Playbook
-# Tự động setup toàn bộ infrastructure trên GCP Ubuntu VM
+# UAV Nested Learning Pipeline — Multi-node (3 VM) Ansible Playbook
 #
-# Chạy: ansible-playbook -i inventory.ini playbook.yml
+# Hyper-converged: all 3 VMs run the same role set (Ceph MON+OSD, Kafka
+# broker+ZooKeeper, k3s server node, RGW+MLflow) so Ceph, Kafka, and k3s
+# each reach a real quorum of 3 within a 3-VM budget. Splitting into
+# dedicated "1 VM per component" roles instead would leave every component
+# with only 1 node — no quorum, no improvement over the single-VM setup.
 #
-# Yêu cầu trên VM: Ubuntu 22.04, 3 disk trống (/dev/sdb, /dev/sdc, /dev/sdd)
-# Yêu cầu trên Mac: ansible >= 2.14, community.docker collection
+# Requirements on each VM: Ubuntu 22.04, 1 free disk for Ceph OSD (/dev/sdb —
+# only 1 disk per VM here, since replication factor 3 now comes from 3 VMs
+# instead of 3 disks on 1 VM as in the single-node version of this file).
+# Requirements on Mac: ansible >= 2.14, community.docker + ansible.posix
+# collections (`ansible-galaxy collection install ansible.posix`).
+#
+# Run: ansible-playbook -i inventory.ini playbook.yml
+#
+# NOT YET VALIDATED AGAINST REAL GCP VMs. This was written from the
+# single-VM playbook plus the documented multi-node procedures for
+# cephadm / k3s / Kafka+ZooKeeper — run it against a disposable test
+# cluster first, and read `ceph -s` / `kubectl get nodes` / kafka-topics
+# output carefully at each stage before trusting it with real data.
+#
+# Postgres for MLflow: self-hosting real HA Postgres across 3 VMs needs
+# Patroni/repmgr (a 4th distributed system) — out of scope here. Two
+# options, controlled by `cloud_sql_private_ip` below:
+#   - set it to a Cloud SQL private IP -> every host's MLflow points at
+#     that one managed instance (recommended).
+#   - leave it blank -> the `postgres` container from docker-compose.yml
+#     runs on the bootstrap host only (centralizes the metadata store, but
+#     that host is then a single point of failure for MLflow specifically).
+#
+# Load balancer for RGW (S3) + MLflow: this playbook does not create a GCP
+# load balancer (that's a one-time infra step, not something to re-apply
+# every run) — see the separate `localhost` play at the bottom for how to
+# set one up. Until it exists, `load_balancer_ip` below falls back to the
+# bootstrap host's own IP, which brings back the "single VM IP" problem
+# this setup exists to avoid — treat that fallback as temporary.
 
-- name: UAV Pipeline — Full Setup
-  hosts: uav_vm
+- name: UAV Pipeline — Multi-node (3 VM) Setup
+  hosts: cluster_nodes
   become: yes
   vars:
     vm_user: "{{ ansible_user }}"
     project_dir: "/home/{{ ansible_user }}/uav"
     git_repo: "https://github.com/YOUR_USERNAME/uav-pipeline.git"
-    ceph_mon_ip: "{{ ansible_default_ipv4.address }}"
     s3_access_key: "uavaccess"
     s3_secret_key: "uavsecret123"
     dashboard_password: "adminpassword"
-    ceph_osd_disks:
-      - /dev/sdb
-      - /dev/sdc
-      - /dev/sdd
+    postgres_password: "mlflowpassword"
+    ceph_osd_disk: /dev/sdb
+    bootstrap_host: "{{ groups['cluster_nodes'][0] }}"
+    is_bootstrap: "{{ inventory_hostname == groups['cluster_nodes'][0] }}"
+    node_index: "{{ groups['cluster_nodes'].index(inventory_hostname) + 1 }}"
+    cloud_sql_private_ip: ""   # e.g. "10.1.2.3" — leave blank for the non-HA fallback
+    load_balancer_ip: ""       # fill in once the GCP internal LB exists (see bottom play)
 
-  # ── BƯỚC 1: Cài system dependencies ─────────────────────────────────────
   tasks:
-    - name: "[1/8] Update apt cache"
-      apt:
-        update_cache: yes
-        cache_valid_time: 3600
+    # ── [1] System dependencies (unchanged from the single-VM version) ─────
+    - name: "[1] Update apt cache"
+      apt: { update_cache: yes, cache_valid_time: 3600 }
 
-    - name: "[1/8] Install system packages"
+    - name: "[1] Install system packages"
       apt:
-        name:
-          - python3.11
-          - python3.11-venv
-          - python3-pip
-          - git
-          - curl
-          - wget
-          - unzip
+        name: [python3.11, python3.11-venv, python3-pip, git, curl, wget, unzip]
         state: present
 
-    - name: "[1/8] Install Docker"
+    - name: "[1] Install Docker"
       shell: curl -fsSL https://get.docker.com | sh
-      args:
-        creates: /usr/bin/docker
+      args: { creates: /usr/bin/docker }
 
-    - name: "[1/8] Add user to docker group"
-      user:
-        name: "{{ vm_user }}"
-        groups: docker
-        append: yes
+    - name: "[1] Add user to docker group"
+      user: { name: "{{ vm_user }}", groups: docker, append: yes }
 
-    - name: "[1/8] Install Docker Compose"
+    - name: "[1] Install Docker Compose"
       get_url:
         url: "https://github.com/docker/compose/releases/latest/download/docker-compose-Linux-x86_64"
         dest: /usr/local/bin/docker-compose
         mode: "0755"
 
-    - name: "[1/8] Download AWS CLI"
-      get_url:
-        url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-        dest: /tmp/awscliv2.zip
+    - name: "[1] Download AWS CLI"
+      get_url: { url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip, dest: /tmp/awscliv2.zip }
 
-    - name: "[1/8] Unzip AWS CLI"
-      unarchive:
-        src: /tmp/awscliv2.zip
-        dest: /tmp/
-        remote_src: yes
+    - name: "[1] Unzip AWS CLI"
+      unarchive: { src: /tmp/awscliv2.zip, dest: /tmp/, remote_src: yes }
 
-    - name: "[1/8] Install AWS CLI"
+    - name: "[1] Install AWS CLI"
       shell: /tmp/aws/install --update
-      args:
-        creates: /usr/local/bin/aws
+      args: { creates: /usr/local/bin/aws }
 
-    - name: "[1/8] Download cephadm"
+    - name: "[1] Download cephadm"
       get_url:
         url: https://github.com/ceph/ceph/raw/quincy/src/cephadm/cephadm
         dest: /usr/local/bin/cephadm
         mode: "0755"
 
-  # ── BƯỚC 2: Bootstrap Ceph ──────────────────────────────────────────────
-    - name: "[2/8] Bootstrap Ceph single-node"
+    # ── [2] Ceph — bootstrap on 1 host, join the other 2, quorum of 3 ──────
+    - name: "[2] Bootstrap Ceph on {{ bootstrap_host }} only"
       shell: |
         cephadm bootstrap \
-          --mon-ip {{ ceph_mon_ip }} \
+          --mon-ip {{ ansible_default_ipv4.address }} \
           --initial-dashboard-user admin \
-          --initial-dashboard-password {{ dashboard_password }} \
-          --skip-monitoring-stack \
-          --single-host-defaults
-      args:
-        creates: /var/lib/ceph
+          --initial-dashboard-password {{ dashboard_password }}
+      args: { creates: /var/lib/ceph }
+      when: is_bootstrap
 
-    - name: "[2/8] Wait for Ceph MON to stabilize"
-      pause:
-        seconds: 45
+    - name: "[2] Wait for Ceph MON to stabilize"
+      pause: { seconds: 45 }
+      when: is_bootstrap
 
-    - name: "[2/8] Add OSDs"
-      shell: "cephadm shell -- ceph orch daemon add osd $(hostname):{{ item }}"
-      loop: "{{ ceph_osd_disks }}"
+    - name: "[2] Read cephadm's SSH pubkey (used to manage the other 2 hosts)"
+      slurp: { src: /etc/ceph/ceph.pub }
+      register: ceph_pubkey_raw
+      when: is_bootstrap
+
+    - name: "[2] Authorize cephadm's key on every host (including bootstrap itself)"
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ hostvars[bootstrap_host].ceph_pubkey_raw.content | b64decode }}"
+
+    - name: "[2] Add the other 2 hosts to the Ceph orchestrator"
+      shell: >
+        cephadm shell -- ceph orch host add {{ item }}
+        {{ hostvars[item].ansible_default_ipv4.address }}
+      loop: "{{ groups['cluster_nodes'] }}"
+      when: is_bootstrap and item != inventory_hostname
       ignore_errors: yes
 
-    - name: "[2/8] Wait for OSDs to come up"
-      pause:
-        seconds: 30
+    - name: "[2] Grow MON to all 3 hosts"
+      shell: >
+        cephadm shell -- ceph orch apply mon
+        --placement="{{ groups['cluster_nodes'] | join(',') }}"
+      when: is_bootstrap
 
-    - name: "[2/8] Enable RadosGW on port 7480"
-      shell: cephadm shell -- ceph orch apply rgw default --port 7480
+    - name: "[2] Set CRUSH failure domain to host (real multi-VM redundancy, not just multi-disk)"
+      shell: cephadm shell -- ceph osd crush rule create-replicated replicated_host default host
+      when: is_bootstrap
+      ignore_errors: yes
 
-    - name: "[2/8] Wait for RadosGW"
-      pause:
-        seconds: 30
+    - name: "[2] Wait for host-add + MON growth to settle"
+      pause: { seconds: 30 }
+      when: is_bootstrap
 
-    - name: "[2/8] Set Ceph dashboard password"
+    - name: "[2] Add each host's own OSD disk"
+      shell: "cephadm shell -- ceph orch daemon add osd {{ item }}:{{ ceph_osd_disk }}"
+      loop: "{{ groups['cluster_nodes'] }}"
+      when: is_bootstrap
+      ignore_errors: yes
+
+    - name: "[2] Wait for OSDs to come up"
+      pause: { seconds: 30 }
+      when: is_bootstrap
+
+    - name: "[2] Enable RadosGW on all 3 hosts (put a load balancer in front — see bottom play)"
+      shell: >
+        cephadm shell -- ceph orch apply rgw default
+        --placement="{{ groups['cluster_nodes'] | join(',') }}" --port 7480
+      when: is_bootstrap
+
+    - name: "[2] Wait for RadosGW"
+      pause: { seconds: 30 }
+      when: is_bootstrap
+
+    - name: "[2] Set Ceph dashboard password"
       shell: echo "{{ dashboard_password }}" | cephadm shell -- ceph dashboard ac-user-set-password admin -i -
+      when: is_bootstrap
 
-    - name: "[2/8] Verify RadosGW responds"
-      uri:
-        url: http://localhost:7480
-        status_code: [200, 403]
-      retries: 6
+    - name: "[2] Verify cluster health"
+      shell: cephadm shell -- ceph -s
+      register: ceph_health
+      when: is_bootstrap
+
+    - name: "[2] Show Ceph health (should say 3 mons, 3 osds up)"
+      debug: { msg: "{{ ceph_health.stdout_lines }}" }
+      when: is_bootstrap
+
+    # ── [3] k3s — cluster-init on 1 host, join on the other 2 (HA embedded etcd) ─
+    - name: "[3] Install k3s server — cluster-init on {{ bootstrap_host }}"
+      shell: curl -sfL https://get.k3s.io | sh -s - server --cluster-init
+      args: { creates: /usr/local/bin/k3s }
+      when: is_bootstrap
+
+    - name: "[3] Wait for the first k3s server to be up"
+      pause: { seconds: 20 }
+      when: is_bootstrap
+
+    - name: "[3] Fetch the join token from {{ bootstrap_host }}"
+      slurp: { src: /var/lib/rancher/k3s/server/node-token }
+      register: k3s_token_raw
+      when: is_bootstrap
+
+    - name: "[3] Install k3s server — join on the other 2 hosts (HA control plane)"
+      shell: >
+        curl -sfL https://get.k3s.io | sh -s - server
+        --server https://{{ hostvars[bootstrap_host].ansible_default_ipv4.address }}:6443
+        --token {{ (hostvars[bootstrap_host].k3s_token_raw.content | b64decode).strip() }}
+      args: { creates: /usr/local/bin/k3s }
+      when: not is_bootstrap
+
+    - name: "[3] Fix kubeconfig permissions on every host"
+      file: { path: /etc/rancher/k3s/k3s.yaml, mode: "0644" }
+
+    - name: "[3] Copy kubeconfig to user home on every host"
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ vm_user }}/.kube/config"
+        owner: "{{ vm_user }}"
+        remote_src: yes
+
+    - name: "[3] Wait for all 3 k3s nodes to be Ready"
+      shell: kubectl get nodes --no-headers | grep -c Ready
+      register: node_ready
+      until: node_ready.stdout | int >= (groups['cluster_nodes'] | length)
+      retries: 24
       delay: 10
+      environment: { KUBECONFIG: "/home/{{ vm_user }}/.kube/config" }
+      when: is_bootstrap
 
-  # ── BƯỚC 3: Clone repo + Python venv ────────────────────────────────────
-    - name: "[3/8] Clone UAV pipeline repo"
-      git:
-        repo: "{{ git_repo }}"
-        dest: "{{ project_dir }}"
-        force: yes
+    # ── [4] Clone repo + venv (every host — flight_agent can run from any of them) ─
+    - name: "[4] Clone UAV pipeline repo"
+      git: { repo: "{{ git_repo }}", dest: "{{ project_dir }}", force: yes }
       become_user: "{{ vm_user }}"
 
-    - name: "[3/8] Create Python venv"
+    - name: "[4] Create Python venv"
       shell: python3.11 -m venv {{ project_dir }}/venv
       become_user: "{{ vm_user }}"
-      args:
-        creates: "{{ project_dir }}/venv/bin/activate"
+      args: { creates: "{{ project_dir }}/venv/bin/activate" }
 
-    - name: "[3/8] Install Python dependencies"
+    - name: "[4] Install Python dependencies"
       shell: "{{ project_dir }}/venv/bin/pip install --upgrade pip && {{ project_dir }}/venv/bin/pip install -r {{ project_dir }}/requirements.txt"
       become_user: "{{ vm_user }}"
 
-  # ── BƯỚC 4: Docker Compose (Kafka + MLflow + Kafka UI + Filestash) ──────
-    - name: "[4/8] Update docker-compose with VM IP"
-      replace:
-        path: "{{ project_dir }}/docker-compose.yml"
-        regexp: 'http://host\.docker\.internal:7480'
-        replace: "http://{{ ceph_mon_ip }}:7480"
+    # ── [5] Kafka + ZooKeeper (3-node ensemble) + MLflow via docker-compose ─
+    - name: "[5] Write per-host .env (Kafka/ZK ids + ensemble list, MLflow backend)"
+      copy:
+        dest: "{{ project_dir }}/.env"
+        content: |
+          ZOOKEEPER_SERVER_ID={{ node_index }}
+          ZOOKEEPER_SERVERS={% for h in groups['cluster_nodes'] %}server.{{ groups['cluster_nodes'].index(h) + 1 }}={{ hostvars[h].ansible_default_ipv4.address }}:2888:3888{% if not loop.last %};{% endif %}{% endfor %}
 
-    - name: "[4/8] Start Docker Compose services"
-      shell: docker-compose up -d
-      args:
-        chdir: "{{ project_dir }}"
+          KAFKA_BROKER_ID={{ node_index }}
+          KAFKA_ZOOKEEPER_CONNECT={% for h in groups['cluster_nodes'] %}{{ hostvars[h].ansible_default_ipv4.address }}:2181{% if not loop.last %},{% endif %}{% endfor %}
+          KAFKA_ADVERTISED_HOST={{ ansible_default_ipv4.address }}
+          KAFKA_ADVERTISED_INTERNAL_HOST={{ ansible_default_ipv4.address }}
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=3
+          KAFKA_DEFAULT_REPLICATION_FACTOR=3
+          KAFKA_NUM_PARTITIONS=3
+
+          MLFLOW_S3_ENDPOINT_URL=http://{{ load_balancer_ip if load_balancer_ip else hostvars[bootstrap_host].ansible_default_ipv4.address }}:7480
+          {% if cloud_sql_private_ip %}
+          MLFLOW_BACKEND_STORE_URI=postgresql://mlflow:{{ postgres_password }}@{{ cloud_sql_private_ip }}:5432/mlflow
+          {% else %}
+          MLFLOW_BACKEND_STORE_URI=postgresql://mlflow:{{ postgres_password }}@{{ hostvars[bootstrap_host].ansible_default_ipv4.address }}:5432/mlflow
+          {% endif %}
+          POSTGRES_PASSWORD={{ postgres_password }}
       become_user: "{{ vm_user }}"
 
-    - name: "[4/8] Wait for MLflow to be ready"
-      uri:
-        url: http://localhost:5000/health
-        status_code: 200
+    - name: "[5] Start zookeeper + kafka (+ postgres on the bootstrap host only) + mlflow"
+      shell: >
+        docker-compose up -d zookeeper kafka mlflow kafka-ui filestash
+        {{ '' if (cloud_sql_private_ip or not is_bootstrap) else 'postgres' }}
+      args: { chdir: "{{ project_dir }}" }
+      become_user: "{{ vm_user }}"
+
+    - name: "[5] Wait for MLflow to be ready"
+      uri: { url: "http://localhost:5000/health", status_code: 200 }
       retries: 12
       delay: 5
+      when: is_bootstrap
 
-  # ── BƯỚC 5: Ceph S3 user + 4 buckets ───────────────────────────────────
-    - name: "[5/8] Create Ceph S3 user"
+    - name: "[5] Increase uav-retrain topic partitions to 3 (lets 3 consumer instances run in parallel)"
+      shell: >
+        docker exec kafka kafka-topics --bootstrap-server localhost:9092
+        --alter --topic uav-retrain --partitions 3 || true
+      when: is_bootstrap
+      # `|| true`: fails harmlessly if the topic doesn't exist yet
+      # (auto-created on first message) — re-run this task after the first
+      # flight if so.
+
+    # ── [6] Ceph S3 user + buckets (once, via the bootstrap host's RGW) ────
+    - name: "[6] Create Ceph S3 user"
       shell: |
         cephadm shell -- radosgw-admin user create \
           --uid=uavuser \
           --display-name="UAV Pipeline User" \
           --access-key={{ s3_access_key }} \
           --secret={{ s3_secret_key }} 2>/dev/null || true
+      when: is_bootstrap
 
-    - name: "[5/8] Configure AWS CLI credentials"
+    - name: "[6] Configure AWS CLI credentials"
       shell: |
         aws configure set aws_access_key_id {{ s3_access_key }}
         aws configure set aws_secret_access_key {{ s3_secret_key }}
@@ -178,140 +295,102 @@
         aws configure set default.output json
       become_user: "{{ vm_user }}"
 
-    - name: "[5/8] Create S3 buckets"
+    - name: "[6] Create S3 buckets"
       shell: "aws --endpoint-url http://localhost:7480 s3 mb s3://{{ item }} 2>/dev/null || true"
       become_user: "{{ vm_user }}"
-      loop:
-        - checkpoints
-        - training-data
-        - mlflow-artifacts
-        - fast-weight-state
+      loop: [checkpoints, training-data, mlflow-artifacts, fast-weight-state]
+      when: is_bootstrap
 
-  # ── BƯỚC 6: k3s + K8s secrets ───────────────────────────────────────────
-    - name: "[6/8] Create k3s config directory"
-      file:
-        path: /etc/rancher/k3s
-        state: directory
-        mode: "0755"
-
-    - name: "[6/8] Configure k3s local registry mirror"
-      copy:
-        dest: /etc/rancher/k3s/registries.yaml
-        content: |
-          mirrors:
-            "localhost:5001":
-              endpoint:
-                - "http://localhost:5001"
-
-    - name: "[6/8] Install k3s"
-      shell: curl -sfL https://get.k3s.io | sh -
-      args:
-        creates: /usr/local/bin/k3s
-
-    - name: "[6/8] Enable and start k3s"
-      systemd:
-        name: k3s
-        state: started
-        enabled: yes
-
-    - name: "[6/8] Fix kubeconfig permissions (and on every reboot)"
-      file:
-        path: /etc/rancher/k3s/k3s.yaml
-        mode: "0644"
-
-    - name: "[6/8] Create systemd service to fix permissions on reboot"
-      copy:
-        dest: /etc/systemd/system/fix-k3s-permissions.service
-        content: |
-          [Unit]
-          Description=Fix k3s kubeconfig permissions after boot
-          After=k3s.service
-
-          [Service]
-          Type=oneshot
-          ExecStart=/bin/chmod 644 /etc/rancher/k3s/k3s.yaml
-
-          [Install]
-          WantedBy=multi-user.target
-
-    - name: "[6/8] Enable permission-fix service"
-      systemd:
-        name: fix-k3s-permissions
-        enabled: yes
-        daemon_reload: yes
-
-    - name: "[6/8] Copy kubeconfig to user home"
-      copy:
-        src: /etc/rancher/k3s/k3s.yaml
-        dest: "/home/{{ vm_user }}/.kube/config"
-        owner: "{{ vm_user }}"
-        remote_src: yes
-      become: yes
-
-    - name: "[6/8] Wait for k3s node to be Ready"
-      shell: kubectl get nodes --no-headers | grep -c Ready
-      register: node_ready
-      until: node_ready.stdout | int >= 1
-      retries: 18
-      delay: 10
-      become_user: "{{ vm_user }}"
-      environment:
-        KUBECONFIG: "/home/{{ vm_user }}/.kube/config"
-
-    - name: "[6/8] Create K8s secret for Ceph + MLflow"
+    # ── [7] K8s secret (cluster-wide resource — create once) ───────────────
+    - name: "[7] Create K8s secret for Ceph + MLflow"
       shell: |
         kubectl delete secret ceph-s3-secret 2>/dev/null || true
         kubectl create secret generic ceph-s3-secret \
           --from-literal=AWS_ACCESS_KEY_ID={{ s3_access_key }} \
           --from-literal=AWS_SECRET_ACCESS_KEY={{ s3_secret_key }} \
-          --from-literal=MLFLOW_S3_ENDPOINT_URL=http://{{ ceph_mon_ip }}:7480 \
-          --from-literal=MLFLOW_TRACKING_URI=http://{{ ceph_mon_ip }}:5000
+          --from-literal=MLFLOW_S3_ENDPOINT_URL=http://{{ load_balancer_ip if load_balancer_ip else hostvars[bootstrap_host].ansible_default_ipv4.address }}:7480 \
+          --from-literal=MLFLOW_TRACKING_URI=http://{{ load_balancer_ip if load_balancer_ip else hostvars[bootstrap_host].ansible_default_ipv4.address }}:5000
       become_user: "{{ vm_user }}"
-      environment:
-        KUBECONFIG: "/home/{{ vm_user }}/.kube/config"
+      environment: { KUBECONFIG: "/home/{{ vm_user }}/.kube/config" }
+      when: is_bootstrap
 
-  # ── BƯỚC 7: Build + push Docker image ───────────────────────────────────
-    - name: "[7/8] Start local Docker registry"
+    # ── [8] Build image on the bootstrap host, mirror it to the other 2 ────
+    - name: "[8] Start local Docker registry on the bootstrap host"
       shell: |
         docker start local-registry 2>/dev/null || \
         docker run -d -p 5001:5000 --name local-registry --restart=unless-stopped registry:2
+      when: is_bootstrap
 
-    - name: "[7/8] Build uav-trainer image"
-      shell: docker build -t uav-trainer:latest {{ project_dir }}
+    - name: "[8] Build + tag + push uav-trainer image (bootstrap host)"
+      shell: |
+        docker build -t uav-trainer:latest {{ project_dir }}
+        docker tag uav-trainer:latest localhost:5001/uav-trainer:latest
+        docker push localhost:5001/uav-trainer:latest
+      when: is_bootstrap
 
-    - name: "[7/8] Tag image for local registry"
-      shell: docker tag uav-trainer:latest localhost:5001/uav-trainer:latest
+    - name: "[8] Point every host's containerd at the bootstrap host's registry"
+      copy:
+        dest: /etc/rancher/k3s/registries.yaml
+        content: |
+          mirrors:
+            "{{ hostvars[bootstrap_host].ansible_default_ipv4.address }}:5001":
+              endpoint:
+                - "http://{{ hostvars[bootstrap_host].ansible_default_ipv4.address }}:5001"
 
-    - name: "[7/8] Push image to local registry"
-      shell: docker push localhost:5001/uav-trainer:latest
+    - name: "[8] Pull uav-trainer image into every host's k3s containerd"
+      shell: >
+        k3s ctr images pull --plain-http
+        {{ hostvars[bootstrap_host].ansible_default_ipv4.address }}:5001/uav-trainer:latest
 
-    - name: "[7/8] Pull image into k3s containerd"
-      shell: k3s ctr images pull --plain-http localhost:5001/uav-trainer:latest
-
-  # ── BƯỚC 8: Generate mock data ───────────────────────────────────────────
-    - name: "[8/8] Generate mock UAV frames"
+    # ── [9] Mock data (each host generates its own — simulates separate UAVs) ─
+    - name: "[9] Generate mock UAV frames"
       shell: "{{ project_dir }}/venv/bin/python3 {{ project_dir }}/scripts/download_mock_data.py"
       become_user: "{{ vm_user }}"
-      environment:
-        PYTHONPATH: "{{ project_dir }}"
+      environment: { PYTHONPATH: "{{ project_dir }}" }
 
-    - name: "Setup complete!"
+    - name: "Setup complete on {{ inventory_hostname }}"
       debug:
         msg: |
-          ✓ Ceph RadosGW   → http://{{ ceph_mon_ip }}:7480
-          ✓ Ceph Dashboard → https://{{ ceph_mon_ip }}:8443  (admin / {{ dashboard_password }})
-          ✓ MLflow UI      → http://{{ ceph_mon_ip }}:5000
-          ✓ Kafka UI       → http://{{ ceph_mon_ip }}:8080
-          ✓ Filestash      → http://{{ ceph_mon_ip }}:8334
+          Ceph RadosGW   -> http://{{ ansible_default_ipv4.address }}:7480  (put a load balancer in front — see below)
+          Ceph Dashboard -> https://{{ hostvars[bootstrap_host].ansible_default_ipv4.address }}:8443  (admin / {{ dashboard_password }})
+          MLflow UI      -> http://{{ ansible_default_ipv4.address }}:5000
+          Kafka UI       -> http://{{ ansible_default_ipv4.address }}:8080
 
-          SSH tunnel từ Mac:
-            ssh -i ~/.ssh/gcp_uav \
-              -L 5000:localhost:5000 \
-              -L 8080:localhost:8080 \
-              -L 8334:localhost:8334 \
-              -L 8443:localhost:8443 \
-              -N {{ ansible_user }}@{{ ansible_host }}
-
-          Chạy demo:
+          Run consumer + watcher (see consumers/model_trainer.py, model_trainer_watcher.py):
             cd {{ project_dir }} && source venv/bin/activate
-            bash scripts/demo.sh
+            python3 -m consumers.model_trainer &
+            python3 -m consumers.model_trainer_watcher &
+
+
+# ── Optional: GCP internal load balancer for RGW (7480) + MLflow (5000) ─────
+# One-time infra step (unlike the play above, which you re-run whenever
+# config drifts) — separated out so it isn't re-applied every run.
+# Run with: ansible-playbook -i inventory.ini playbook.yml --tags loadbalancer
+- name: Optional — GCP internal load balancer across the 3 VMs
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tags: [loadbalancer, never]   # "never" = skip unless explicitly tagged
+  vars:
+    network: "default"
+    subnet: "default"
+    region: "asia-southeast1"
+  tasks:
+    - name: "GCP load balancer — commands to run by hand (depends on your zone/network layout)"
+      debug:
+        msg: >
+          gcloud compute instance-groups unmanaged create uav-cluster-ig --zone=<zone> ;
+          gcloud compute instance-groups unmanaged add-instances uav-cluster-ig --zone=<zone>
+          --instances=uav-vm-1,uav-vm-2,uav-vm-3 ;
+          gcloud compute health-checks create tcp uav-rgw-hc --port=7480 ;
+          gcloud compute backend-services create uav-rgw-backend --load-balancing-scheme=INTERNAL
+          --protocol=TCP --health-checks=uav-rgw-hc --region={{ region }} ;
+          gcloud compute backend-services add-backend uav-rgw-backend --region={{ region }}
+          --instance-group=uav-cluster-ig --instance-group-zone=<zone> ;
+          gcloud compute forwarding-rules create uav-rgw-fr --load-balancing-scheme=INTERNAL
+          --backend-service=uav-rgw-backend --region={{ region }} --ports=7480
+          --network={{ network }} --subnet={{ subnet }} ;
+          Repeat the health-check/backend-service/forwarding-rule trio for port 5000 (MLflow).
+          The resulting forwarding-rule IP goes into `load_balancer_ip` above and into
+          config/settings.py's S3_ENDPOINT / MLFLOW_URI on every client, instead of a
+          single VM's IP.
